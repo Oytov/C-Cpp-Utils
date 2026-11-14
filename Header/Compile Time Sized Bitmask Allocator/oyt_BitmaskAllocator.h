@@ -1,274 +1,330 @@
-/*
-Provides compile time sized bitmask/slab allocators, using a nested approach for O(logn) allocations.
+/**
+ * Compile time sized bitmask allocator. Not thread safe.
+ *
+ * Using the header (somewhat like a cpp template):
+ * #define OYT_BITMASK_ALLOC_SIZE 256
+ * #include "oyt_BitmaskAllocator.h"
+ * // OYT_BITMASK_ALLOC_SIZE is no longer defined
+ *
+ * Note: OYT_BITMASK_ALLOC_SIZE must be a plain integer literal.
+ *
+ * You then have:
+ * Constant:
+ *    OYT_BITMASK_ALLOC_CAPACITY - maximum value that OYT_BITMASK_ALLOC_SIZE can be defined with.
+ *
+ * Type:
+ *     oyt_BitmaskAlloc256
+ *
+ * Functions:
+ *     oyt_BitmaskAlloc256_init()
+ *     oyt_BitmaskAlloc256_alloc()
+ *     oyt_BitmaskAlloc256_free()
+ *
+ * The header can be included multiple times.
+ * Defining OYT_BITMASK_ALLOC_SIZE as a previously defined value will occur in a redefinition error.
+ */
 
-
-Public API:
-	OYT_BITMASK_MAXIMUM_ALLOCATIONS
-	OYT_BITMASK_FAILED_ALLOCATION
-
-	OYT_BITMASK_DEFINE_STRUCT(maxAllocations_, StructName_)
-	OYT_BITMASK_DEFINE(maxAllocations_, variableName_)
-	OYT_BITMASK_INIT(allocator_, maxAllocations_)
-	OYT_BITMASK_ALLOCATE(allocator_, out_)
-	OYT_BITMASK_FREE(allocator_, allocatedIndex_)
-
-Detailed descriptions can be found in doxygen comment style at the macros' definition.
-
-
-Maybe good to keep in mind:
-1.	Instead of invoking the macro in multiple places, define a function for allocating, freeing, etc.
-	Should reduce code size (untested).
-	```c
-	#define ALLOCATIONS_REQUIRED 42
-	OYT_BITMASK_DEFINE_STRUCT(ALLOCATIONS_REQUIRED, Foo);
-
-	size_t allocate(struct Foo *pAllocator) {
-		size_t out;
-		OYT_BITMASK_ALLOCATE(*pAllocator, out);
-		return out;
-	}
-	
-	int main(void) {
-		struct Foo allocator;
-		OYT_BITMASK_INIT(allocator, ALLOCATIONS_REQUIRED);
-
-		size_t allocatedIndex = allocate(&allocator);
-		...
-	}
-	```
-*/
-
-#ifndef oyt_BitmaskAllocator_h
-#define oyt_BitmaskAllocator_h
-#include <stddef.h>
 #include <limits.h>
 
-#define OYTBA__WIDTH_OF_SIZE_T   (sizeof(size_t)*CHAR_BIT)
-#define OYTBA__WIDTH_OF_SIZE_T_2 (OYTBA__WIDTH_OF_SIZE_T   * OYTBA__WIDTH_OF_SIZE_T)
-#define OYTBA__WIDTH_OF_SIZE_T_3 (OYTBA__WIDTH_OF_SIZE_T_2 * OYTBA__WIDTH_OF_SIZE_T)
-#define OYTBA__WIDTH_OF_SIZE_T_4 (OYTBA__WIDTH_OF_SIZE_T_2 * OYTBA__WIDTH_OF_SIZE_T_2)
-
-/**
- * @brief Absolute maximum allocations a bitmask allocator can have
- */
-#define OYT_BITMASK_MAXIMUM_ALLOCATIONS OYTBA__WIDTH_OF_SIZE_T_4
-
-#if defined(_MSC_VER)
-# include <intrin.h>
+#if defined(_MSC_VER) && !defined(__clang__)
+	#include <intrin.h>
 #endif
 
-#if (defined (__STDC_VERSION__) && __STDC_VERSION__ >= 199901L) || (defined(__cplusplus) && __cplusplus >= 199711L)
-	inline
-#endif
-static size_t oytba__clz(size_t x) { /* NOLINT(clang-diagnostic-unused-function) */
-
-	if (x == 0) return OYTBA__WIDTH_OF_SIZE_T;
-
-#if defined(__GNUC__) || defined(__clang__)
-
-	if (sizeof(size_t) == sizeof(unsigned int))
-		return (size_t)__builtin_clz((unsigned int)x);
-
-	if (sizeof(size_t) == sizeof(unsigned long))
-		return (size_t)__builtin_clzl((unsigned long)x);
-
-	if (sizeof(size_t) == __extension__(sizeof(unsigned long long)))
-		return (size_t)__builtin_clzll(__extension__((unsigned long long)x));
-
-#elif defined(_MSC_VER)
-
-	if (sizeof(size_t) <= sizeof(unsigned int)) {
-		unsigned long index;
-		_BitScanReverse(&index, (unsigned long)x);
-		return (size_t)(OYTBA__WIDTH_OF_SIZE_T - 1 - (size_t)index);
-	}
-
-	# if defined(_M_X64) || defined(_M_ARM64)
-
-	if (sizeof(size_t) <= sizeof(unsigned __int64)) {
-		unsigned long index;
-		_BitScanReverse64(&index, (unsigned __int64)x);
-		return (size_t)(OYTBA__WIDTH_OF_SIZE_T - 1 - (size_t)index);
-	}
-
-	# endif /* _M_X64 || _M_ARM64 */
-
+/* Verify OYT_BITMASK_ALLOC_SIZE exists */
+#ifndef OYT_BITMASK_ALLOC_SIZE
+	#error "OYT_BITMASK_ALLOC_SIZE isn't defined."
 #endif
 
-	{ /* Portable O(log W) fallback. */
-	size_t lo = 0;
-	size_t hi = OYTBA__WIDTH_OF_SIZE_T;
+#define OYTBA_CAT_(a_, b_) a_##b_
+#define OYTBA_CAT(a_, b_)  OYTBA_CAT_(a_, b_)
 
-	while (lo < hi) {
-		const size_t mid = lo + (hi - lo + 1) / 2;
+#define OYTBA_T OYTBA_CAT(oyt_BitmaskAlloc, OYT_BITMASK_ALLOC_SIZE)
 
-		if ((x >> (OYTBA__WIDTH_OF_SIZE_T - mid)) == 0)
-			lo = mid;
-		else
-			hi = mid - 1;
-	}
-
-	return  lo;
-	}
-}
-
-#define OYTBA__ALL_ONES (~(size_t)0)
-
-#define OYTBA__DIVIDE_CEIL(dividend_, divisor_) ( ((dividend_) + ((divisor_) - 1)) / (divisor_) )
-
-#define OYTBA__LENGTH(array_) ( sizeof(array_) / sizeof((array_)[0]) )
-
-#define OYTBA__LOGWIDTH(x_) \
-((x_) == 0 ? -1 : \
- (x_) <= OYTBA__WIDTH_OF_SIZE_T   ? 1 : \
- (x_) <= OYTBA__WIDTH_OF_SIZE_T_2 ? 2 : \
- (x_) <= OYTBA__WIDTH_OF_SIZE_T_3 ? 3 : \
- (x_) <= OYTBA__WIDTH_OF_SIZE_T_4 ? 4 : -1)
-
-#if defined(__STDC_VERSION__) && __STDC_VERSION__ >= 201112L
-	#define OYTBA__STATIC_ASSERT(cond_, msg_) _Static_assert(cond_, msg_);
-#elif defined(__cplusplus) && __cplusplus >= 201103L
-	#define OYTBA__STATIC_ASSERT(cond_, msg_) static_assert(cond_, msg_);
+/* C standard */
+#if defined(__STDC_VERSION__)
+	#define OYTBA_C_VERSION __STDC_VERSION__
 #else
-	#define OYTBA__STATIC_ASSERT(cond_, msg_)
+	#define OYTBA_C_VERSION 0
 #endif
 
-/**
- * @brief Value specifying that the allocation failed, i.e. no more slots to be allocated.
- */
-#define OYT_BITMASK_FAILED_ALLOCATION OYTBA__ALL_ONES
+/* C++ standard */
+#if defined(_MSVC_LANG)
+	#define OYTBA_CPP_VERSION _MSVC_LANG
+#elif defined(__cplusplus)
+	#define OYTBA_CPP_VERSION __cplusplus
+#else
+	#define OYTBA_CPP_VERSION 0
+#endif
+
+/* Inline function-specifier */
+#if OYTBA_CPP_VERSION >= 199711L || OYTBA_C_VERSION >= 199901L
+	#define OYTBA_INLINE inline
+#else
+	#define OYTBA_INLINE
+#endif
+
+/* Bitmask type */
+#define OYTBA_MASK_USING_ULONG_LONG 1
+#define OYTBA_MASK_USING_ULONG 2
+#if OYTBA_CPP_VERSION >= 201103L || OYTBA_C_VERSION >= 199901L
+	#define OYTBA_MASK_USING OYTBA_MASK_USING_ULONG_LONG
+	#define OYTBA_MASK_T unsigned long long
+	#define OYTBA_MASK_WIDTH 64ull
+#else
+	#define OYTBA_MASK_USING OYTBA_MASK_USING_ULONG
+	#define OYTBA_MASK_T unsigned long
+
+	/* Width of long > 32bits */
+	#if ULONG_MAX > 0xFFFFFFFFUL
+		#if ULONG_MAX >= 0xFFFFFFFFFFFFFFFFUL
+			#define OYTBA_MASK_WIDTH 64ul
+		#endif
+	#else
+		#define OYTBA_MASK_WIDTH 32ul
+	#endif
+#endif
+
+#if !defined(OYTBA_MASK_USING) || !defined(OYTBA_MASK_T) || !defined(OYTBA_MASK_WIDTH)
+	#error "No type defined or width"
+#endif
+
+#define OYTBA_MASK_WIDTH_POW2 (OYTBA_MASK_WIDTH      * OYTBA_MASK_WIDTH)
+#define OYTBA_MASK_WIDTH_POW3 (OYTBA_MASK_WIDTH_POW2 * OYTBA_MASK_WIDTH)
+#define OYTBA_MASK_WIDTH_POW4 (OYTBA_MASK_WIDTH_POW3 * OYTBA_MASK_WIDTH)
+
+#if OYTBA_MASK_WIDTH == 32
+	#define OYT_BITMASK_ALLOC_CAPACITY (32ul * 32ul * 32ul * 32ul)
+#elif OYTBA_MASK_WIDTH == 64
+	#define OYT_BITMASK_ALLOC_CAPACITY (64ul * 64ul * 64ul * 64ul)
+#else
+	#error "OYT_BITMASK_ALLOC_CAPACITY cant be defined due to an unsupported mask width."
+#endif
+
+#define OYTBA_CEIL_DIV(a_, b_) ( ((a_) - 1 + (b_)) / (b_) )
+#define OYTBA_LEN(x_) (sizeof(x_) / sizeof((x_)[0]))
 
 /**
- * @brief Define a struct for a bitmask allocator
- *
- * Struct can then be used with `struct StructName_`
- *
- * @param[in]	maxAllocations_		Maximum allocations for this allocator struct to have
- * @param[in]	StructName_			Name for the struct
+ * @struct Bitmask allocator type.
  */
-#define OYT_BITMASK_DEFINE_STRUCT(maxAllocations_, StructName_) \
-OYTBA__STATIC_ASSERT((maxAllocations_) != 0, "Maximum allocations cannot be 0") \
-OYTBA__STATIC_ASSERT((maxAllocations_) <= OYTBA__WIDTH_OF_SIZE_T_4, "Maximum allocations is too large") \
-struct StructName_ { \
-	size_t lengths[OYTBA__LOGWIDTH(maxAllocations_)]; \
-	size_t bitmask[ \
-		1 + \
-		OYTBA__DIVIDE_CEIL(maxAllocations_, OYTBA__WIDTH_OF_SIZE_T) + \
-		OYTBA__DIVIDE_CEIL(maxAllocations_, OYTBA__WIDTH_OF_SIZE_T_2) + \
-		OYTBA__DIVIDE_CEIL(maxAllocations_, OYTBA__WIDTH_OF_SIZE_T_3) + \
-		OYTBA__DIVIDE_CEIL(maxAllocations_, OYTBA__WIDTH_OF_SIZE_T_4) - \
-		(5 - OYTBA__LOGWIDTH(maxAllocations_)) \
-	]; \
+typedef struct {
+#if OYT_BITMASK_ALLOC_SIZE <= 0 || OYT_BITMASK_ALLOC_SIZE > OYT_BITMASK_ALLOC_CAPACITY
+	char empty_struct_warning_be_quiet;
+	#error "OYT_BITMASK_ALLOC_SIZE has to be a positive integer less than or equal to OYT_BITMASK_ALLOC_CAPACITY."
+#elif OYT_BITMASK_ALLOC_SIZE <= OYTBA_MASK_WIDTH
+	#define OYTBA_LEN1 OYT_BITMASK_ALLOC_SIZE
+
+	OYTBA_MASK_T mask0;
+#elif OYT_BITMASK_ALLOC_SIZE <= OYTBA_MASK_WIDTH_POW2
+	#define OYTBA_LEN1 OYTBA_CEIL_DIV(OYT_BITMASK_ALLOC_SIZE, OYTBA_MASK_WIDTH)
+	#define OYTBA_LEN2 OYT_BITMASK_ALLOC_SIZE
+
+	OYTBA_MASK_T mask0;
+	OYTBA_MASK_T mask1[OYTBA_LEN1];
+#elif OYT_BITMASK_ALLOC_SIZE <= OYTBA_MASK_WIDTH_POW3
+	#define OYTBA_LEN1 OYTBA_CEIL_DIV(OYT_BITMASK_ALLOC_SIZE, OYTBA_MASK_WIDTH_POW2)
+	#define OYTBA_LEN2 OYTBA_CEIL_DIV(OYT_BITMASK_ALLOC_SIZE, OYTBA_MASK_WIDTH)
+	#define OYTBA_LEN3 OYT_BITMASK_ALLOC_SIZE
+
+	OYTBA_MASK_T mask0;
+	OYTBA_MASK_T mask1[OYTBA_LEN1];
+	OYTBA_MASK_T mask2[OYTBA_LEN2];
+#elif OYT_BITMASK_ALLOC_SIZE <= OYTBA_MASK_WIDTH_POW4
+	#define OYTBA_LEN1 OYTBA_CEIL_DIV(OYT_BITMASK_ALLOC_SIZE, OYTBA_MASK_WIDTH_POW3)
+	#define OYTBA_LEN2 OYTBA_CEIL_DIV(OYT_BITMASK_ALLOC_SIZE, OYTBA_MASK_WIDTH_POW2)
+	#define OYTBA_LEN3 OYTBA_CEIL_DIV(OYT_BITMASK_ALLOC_SIZE, OYTBA_MASK_WIDTH)
+	#define OYTBA_LEN4 OYT_BITMASK_ALLOC_SIZE
+
+	OYTBA_MASK_T mask0;
+	OYTBA_MASK_T mask1[OYTBA_LEN1];
+	OYTBA_MASK_T mask2[OYTBA_LEN2];
+	OYTBA_MASK_T mask3[OYTBA_LEN3];
+#endif
+} OYTBA_T;
+
+#if OYTBA_MASK_USING == OYTBA_MASK_USING_ULONG
+	#define OYTBA_MSB ( ~((~0ul)  >> 1) )
+#elif OYTBA_MASK_USING == OYTBA_MASK_USING_ULONG_LONG
+	#define OYTBA_MSB ( ~((~0ull) >> 1) )
+#endif
+
+#ifndef OYTBA_CLZ_DEFINED
+#define OYTBA_CLZ_DEFINED
+static OYTBA_INLINE unsigned oytba_clz(OYTBA_MASK_T x) {
+	if (x == 0) return OYTBA_MASK_WIDTH;
+#if defined(__GNUC__) || defined(__clang__)
+	#if OYTBA_MASK_USING == OYTBA_MASK_USING_ULONG
+		return (unsigned)__builtin_clzl(x);
+	#elif OYTBA_MASK_USING == OYTBA_MASK_USING_ULONG_LONG
+		return (unsigned)__builtin_clzll(x);
+	#endif
+#elif defined(_MSC_VER)
+	{
+	unsigned long index;
+	#if OYTBA_MASK_USING == OYTBA_MASK_USING_ULONG
+		_BitScanReverse(&index, x);
+		return (unsigned)(OYTBA_MASK_WIDTH - 1 - index);
+	#elif defined(_M_X64) || defined(_M_ARM64)
+		_BitScanReverse64(&index, x);
+		return (unsigned)(OYTBA_MASK_WIDTH - 1 - index);
+	#endif
+	}
+#endif
+	{
+	unsigned shift, n = 0;
+
+	for (shift = OYTBA_MASK_WIDTH / 2; shift != 0; shift >>= 1) {
+		if ((x >> (OYTBA_MASK_WIDTH - shift)) == 0) {
+			n += shift;
+			x <<= shift;
+		}
+	}
+	return n;
+	}
+}
+#endif
+
+
+
+#define OYTBA_SET_BIT_FREE(mask_, idx_)     (mask_) |=  (OYTBA_MSB >> (idx_))
+#define OYTBA_SET_BIT_OCCUPIED(mask_, idx_) (mask_) &= ~(OYTBA_MSB >> (idx_))
+
+#define OYTBA_SET_ARRAY_ALL_ONES(array_) do {unsigned long i; for (i = 0; i < OYTBA_LEN(array_); i++) (array_)[i] = ~((OYTBA_MASK_T)0);} while(0)
+
+/**
+ * @brief Initialize.
+ *
+ * @param[in,out]	pAllocator	Memory for a bitmask allocator
+ */
+static OYTBA_INLINE void OYTBA_CAT(OYTBA_T, _init)(OYTBA_T *pAllocator) {
+#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH_POW3
+	OYTBA_SET_ARRAY_ALL_ONES(pAllocator->mask3);
+#endif
+#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH_POW2
+	OYTBA_SET_ARRAY_ALL_ONES(pAllocator->mask2);
+#endif
+#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH
+	OYTBA_SET_ARRAY_ALL_ONES(pAllocator->mask1);
+#endif
+	pAllocator->mask0 =~((OYTBA_MASK_T)0);
 }
 
-#define OYTBA__EMPTY
+#define OYTBA_ALLOC_GET_BIT_CODE(level_, levelPlusOne_) \
+unsigned idx##level_ = oytba_clz(pAllocator->mask##level_[queryIndex]); \
+out = queryIndex * OYTBA_MASK_WIDTH + idx##level_; \
+if (out >= OYTBA_LEN##levelPlusOne_) return OYT_BITMASK_ALLOC_SIZE
+
+#define OYTBA_ALLOC_CLEAR_BIT_CODE(level_, levelPlusOne_) \
+OYTBA_SET_BIT_OCCUPIED(pAllocator->mask##level_[queryIndex], idx##level_); \
+idx##level_ = oytba_clz(pAllocator->mask##level_[queryIndex]); \
+if (idx##level_ < OYTBA_MASK_WIDTH && queryIndex * OYTBA_MASK_WIDTH + idx##level_ < OYTBA_LEN##levelPlusOne_) \
+	return out; \
+queryIndex /= OYTBA_MASK_WIDTH
 
 /**
- * @brief Define a variable for a bitmask allocator, an anonymous struct is used
+ * @brief Allocate an index.
  *
- * Struct variable can then be accessed by `variableName_`
+ * @param[in]	pAllocator	Pointer to a bitmask allocator
  *
- * @param[in]	maxAllocations_		Maximum allocations for this allocator to have
- * @param[in]	variableName_		Name for the struct variable
+ * @return Allocated index or OYT_BITMASK_ALLOC_SIZE if allocator is full.
  */
-#define OYT_BITMASK_DEFINE(maxAllocations_, variableName_) OYT_BITMASK_DEFINE_STRUCT(maxAllocations_, OYTBA__EMPTY) variableName_
+static OYTBA_INLINE unsigned long OYTBA_CAT(OYTBA_T, _alloc)(OYTBA_T *pAllocator) {
+	unsigned long out;
+	const unsigned idx0 = oytba_clz(pAllocator->mask0);
+	out = idx0;
+	if (out >= OYTBA_LEN1)
+		return OYT_BITMASK_ALLOC_SIZE;
+
+	#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH
+	{
+		unsigned long queryIndex = out;
+		OYTBA_ALLOC_GET_BIT_CODE(1, 2);
+
+		#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH_POW2
+		queryIndex = out;
+		{
+			OYTBA_ALLOC_GET_BIT_CODE(2, 3);
+
+			#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH_POW3
+			queryIndex = out;
+			{
+				OYTBA_ALLOC_GET_BIT_CODE(3, 4);
+				OYTBA_ALLOC_CLEAR_BIT_CODE(3, 4);
+			}
+			#endif
+
+			OYTBA_ALLOC_CLEAR_BIT_CODE(2, 3);
+		}
+		#endif
+
+		OYTBA_ALLOC_CLEAR_BIT_CODE(1, 2);
+	}
+	#endif
+
+	OYTBA_SET_BIT_OCCUPIED(pAllocator->mask0, idx0);
+
+	return out;
+}
 
 /**
- * @brief Initializes a struct variable
+ * @brief Free an index.
  *
- * @param[out]	allocator_			Allocator struct variable
- * @param[in]	maxAllocations_		Maximum allocations - same value used while defining the struct or struct variable
+ * @param[in]	pAllocator	Pointer to a bitmask allocator
+ * @param[in]	index		Index to free
  */
-#define OYT_BITMASK_INIT(allocator_, maxAllocations_) \
-do { \
-	const size_t oytba__lastElementUsedBitsCount = 1 + ((maxAllocations_) - 1) % OYTBA__WIDTH_OF_SIZE_T; \
-	size_t oytba__i, oytba__cumLen; \
-	(allocator_).lengths[OYTBA__LENGTH((allocator_).lengths) - 1] = OYTBA__DIVIDE_CEIL(maxAllocations_, OYTBA__WIDTH_OF_SIZE_T); \
-	oytba__cumLen = (allocator_).lengths[OYTBA__LENGTH((allocator_).lengths) - 1]; \
-	for (oytba__i = OYTBA__LENGTH((allocator_).lengths) - 1; oytba__i-- > 0;) { \
-		(allocator_).lengths[oytba__i] = OYTBA__DIVIDE_CEIL((allocator_).lengths[oytba__i + 1], OYTBA__WIDTH_OF_SIZE_T); \
-		oytba__cumLen += (allocator_).lengths[oytba__i]; \
-	} \
-	for (oytba__i = 0; oytba__i < oytba__cumLen; oytba__i++) { \
-		(allocator_).bitmask[oytba__i] = OYTBA__ALL_ONES; \
-	} \
-	if (oytba__lastElementUsedBitsCount != OYTBA__WIDTH_OF_SIZE_T) { \
-		const size_t oytba__leftShiftAmount = OYTBA__WIDTH_OF_SIZE_T - oytba__lastElementUsedBitsCount; \
-		const size_t oytba__mask = (((size_t)1 << oytba__lastElementUsedBitsCount) - 1) << oytba__leftShiftAmount; \
-		(allocator_).bitmask[oytba__i - 1] &= oytba__mask; \
-	} \
-} while (0)
+static OYTBA_INLINE void OYTBA_CAT(OYTBA_T, _free)(OYTBA_T *pAllocator, unsigned long index) {
+	unsigned long bitIdx;
+	if (index >= OYT_BITMASK_ALLOC_SIZE) return;
+#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH_POW3
+	bitIdx = index % OYTBA_MASK_WIDTH;
+	index /= OYTBA_MASK_WIDTH;
+	OYTBA_SET_BIT_FREE(pAllocator->mask3[index], bitIdx);
+#endif
+#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH_POW2
+	bitIdx = index % OYTBA_MASK_WIDTH;
+	index /= OYTBA_MASK_WIDTH;
+	OYTBA_SET_BIT_FREE(pAllocator->mask2[index], bitIdx);
+#endif
+#if OYT_BITMASK_ALLOC_SIZE > OYTBA_MASK_WIDTH
+	bitIdx = index % OYTBA_MASK_WIDTH;
+	index /= OYTBA_MASK_WIDTH;
+	OYTBA_SET_BIT_FREE(pAllocator->mask1[index], bitIdx);
+#endif
+	bitIdx = index % OYTBA_MASK_WIDTH;
+	OYTBA_SET_BIT_FREE(pAllocator->mask0, bitIdx);
+}
 
-#define OYTBA__MASK(index_) ( ((size_t)1) << (OYTBA__WIDTH_OF_SIZE_T - 1 - (index_)) )
+#undef OYTBA_ALLOC_CLEAR_BIT_CODE
+#undef OYTBA_ALLOC_GET_BIT_CODE
 
-/**
- * @brief Allocates an index in range [0, maxAllocations). Lowest free index first.
- *
- * OYT_BITMASK_FAILED_ALLOCATION is written to out_ on failure to allocate, i.e. no more free slots.
- *
- * @param[in]	allocator_	Allocator struct variable
- * @param[out]	out_		Allocated index output, plain size_t lvalue that doesnt appear in allocator_
- */
-#define OYT_BITMASK_ALLOCATE(allocator_, out_) \
-do { \
-	const size_t oytba__levelCount =  OYTBA__LENGTH((allocator_).lengths); \
-	size_t oytba__i, oytba__cumLen, oytba__lzIndices[4], oytba__maskIndices[4]; \
-	oytba__lzIndices[0] = oytba__maskIndices[0] = oytba__cumLen = (out_) = 0; \
-	for (oytba__i = 1; oytba__i < oytba__levelCount; oytba__i++) { \
-		size_t oytba__maxIndex = (allocator_).lengths[oytba__i] - OYTBA__WIDTH_OF_SIZE_T * (out_); \
-		if (oytba__maxIndex > OYTBA__WIDTH_OF_SIZE_T) oytba__maxIndex = OYTBA__WIDTH_OF_SIZE_T; \
-		oytba__lzIndices[oytba__i] = oytba__clz( (allocator_).bitmask[oytba__maskIndices[oytba__i - 1]] ); \
-		if (oytba__lzIndices[oytba__i] >= oytba__maxIndex) { (out_) = OYT_BITMASK_FAILED_ALLOCATION; break; } \
-		oytba__cumLen += (allocator_).lengths[oytba__i - 1]; \
-		(out_) = (out_) * OYTBA__WIDTH_OF_SIZE_T + oytba__lzIndices[oytba__i]; \
-		oytba__maskIndices[oytba__i] = oytba__cumLen + (out_); \
-	} \
-	if ((out_) != OYT_BITMASK_FAILED_ALLOCATION) { \
-		const size_t oytba__lzIdx = oytba__clz( (allocator_).bitmask[oytba__maskIndices[oytba__levelCount-1]] ); \
-		size_t oytba__isBitmaskZero; \
-		(out_) = (out_) * OYTBA__WIDTH_OF_SIZE_T + oytba__lzIdx; \
-		if (oytba__levelCount == 1 && (out_) == OYTBA__WIDTH_OF_SIZE_T) { \
-			(out_) = OYT_BITMASK_FAILED_ALLOCATION; \
-		} else { \
-			(allocator_).bitmask[oytba__maskIndices[oytba__levelCount-1]] &= ~OYTBA__MASK(oytba__lzIdx); \
-			oytba__isBitmaskZero = (allocator_).bitmask[oytba__maskIndices[oytba__levelCount-1]] == 0; \
-			for (oytba__i = oytba__levelCount - 1; oytba__i > 0; oytba__i--) { \
-				if (!oytba__isBitmaskZero) break; \
-				(allocator_).bitmask[oytba__maskIndices[oytba__i - 1]] &= ~(OYTBA__MASK(oytba__lzIndices[oytba__i])); \
-				oytba__isBitmaskZero = (allocator_).bitmask[oytba__maskIndices[oytba__i - 1]] == 0; \
-			} \
-		} \
-	} \
-} while(0)
+#undef OYTBA_SET_ARRAY_ALL_ONES
+#undef OYTBA_SET_BIT_OCCUPIED
+#undef OYTBA_SET_BIT_FREE
+#undef OYTBA_MSB
 
-/**
- * @brief Frees an allocated index
- *
- * @param[in]	allocator_			Allocator struct variable
- * @param[in]	allocatedIndex_		Allocated index being freed
- *
- * @note No bounds checks are done. This results in:
- *       1. Freeing OYT_BITMASK_FAILED_ALLOCATION - or a value greater than or equal to the next multiple
- *          of OYTBA__WIDTH_OF_SIZE_T - will cause an out of bounds memory access.
- *       2. If using a maximum allocation count that isn't a multiple of OYTBA__WIDTH_OF_SIZE_T
- *          and an index in the range [maxAllocations, next multiple of OYTBA__WIDTH_OF_SIZE_T)
- *          is freed, then more allocations than maxAllocations can be allocated (padding gets corrupted).
- */
-#define OYT_BITMASK_FREE(allocator_, allocatedIndex_) \
-do { \
-	const size_t oytba__levelCount =  OYTBA__LENGTH((allocator_).lengths); \
-	size_t oytba__idx = (size_t)(allocatedIndex_); \
-	size_t oytba__i, oytba__cumLen = 0; \
-	for (oytba__i = 0; oytba__i < oytba__levelCount; oytba__i++) \
-		oytba__cumLen += (allocator_).lengths[oytba__i]; \
-	for (oytba__i = oytba__levelCount; oytba__i > 0; oytba__i--) { \
-		const size_t oytba__mask = OYTBA__MASK((oytba__idx) % OYTBA__WIDTH_OF_SIZE_T); \
-		size_t oytba__maskIdx; \
-		oytba__idx /= OYTBA__WIDTH_OF_SIZE_T; \
-		oytba__cumLen -= (allocator_).lengths[oytba__i - 1]; \
-		oytba__maskIdx = oytba__cumLen + oytba__idx; \
-		(allocator_).bitmask[oytba__maskIdx] |= oytba__mask; \
-	} \
-} while(0)
+#undef OYTBA_LEN4
+#undef OYTBA_LEN3
+#undef OYTBA_LEN2
+#undef OYTBA_LEN1
 
-#endif /* oyt_BitmaskAllocator_h */
+#undef OYTBA_LEN
+#undef OYTBA_CEIL_DIV
+
+#undef OYTBA_MASK_WIDTH_POW4
+#undef OYTBA_MASK_WIDTH_POW3
+#undef OYTBA_MASK_WIDTH_POW2
+#undef OYTBA_MASK_WIDTH
+#undef OYTBA_MASK_T
+
+#undef OYTBA_MASK_USING
+#undef OYTBA_MASK_USING_ULONG
+#undef OYTBA_MASK_USING_ULONG_LONG
+
+#undef OYTBA_INLINE
+#undef OYTBA_CPP_VERSION
+#undef OYTBA_C_VERSION
+
+#undef OYTBA_T
+#undef OYTBA_CAT
+#undef OYTBA_CAT_
+
+#undef OYT_BITMASK_ALLOC_SIZE

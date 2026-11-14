@@ -1,45 +1,43 @@
-C89 compatible library for compile time sized bitmask/slab allocators.
+C89 compatible library for compile time sized bitmask/slab allocator.
 
 Example:
 ```c
 #include <stdio.h>
+
+#define OYT_BITMASK_ALLOC_SIZE 1000
 #include "oyt_BitmaskAllocator.h"
 
-#define MAX_ALLOCATIONS 1000
-
 int main(void) {
-	size_t i, lastIdx, idx;
-	int allocationFailed;
+	unsigned long i, lastIdx, idx;
+	
+	oyt_BitmaskAlloc1000 alloc;
+	oyt_BitmaskAlloc1000_init(&alloc);
 
-	OYT_BITMASK_DEFINE(MAX_ALLOCATIONS, allocator);
-	OYT_BITMASK_INIT(allocator, MAX_ALLOCATIONS);
-
-	allocationFailed = 0;
-	OYT_BITMASK_ALLOCATE(allocator, lastIdx);
-	for (i = 1; i < MAX_ALLOCATIONS; i++) {
-		OYT_BITMASK_ALLOCATE(allocator, idx);
-
+	/* Allocation order promise */
+	lastIdx = oyt_BitmaskAlloc1000_alloc(&alloc);
+	for (i = 1; i < 1000; i++) {
+		idx = oyt_BitmaskAlloc1000_alloc(&alloc);
 		if (idx != lastIdx + 1) {
-			allocationFailed = 1;
-			printf("Current allocation %zu isn't after previous allocation %zu\n", idx, lastIdx);
+			puts("[-] Lowest index first promise not met");
+			return 0;
 		}
-
 		lastIdx = idx;
 	}
-	
-	if (!allocationFailed) {
-		puts("All allocations succeeded");
-	}
-	else {
-		puts("At least one allocation failure");
-		return 0;
+
+	/* Verify no over allocation */
+	for (i = 0; i < 42; i++) {
+		if (oyt_BitmaskAlloc1000_alloc(&alloc) != 1000) {
+			puts("[-] More allocations than the maximum are occuring");
+			return 0;
+		}
 	}
 
-	OYT_BITMASK_FREE(allocator, 0);
-	for (i = 1; i < MAX_ALLOCATIONS; i++) {
-		OYT_BITMASK_FREE(allocator, i);
+	/* Freeing */
+	for (i = 0; i < 1000; i++) {
+		oyt_BitmaskAlloc1000_free(&alloc, i);
 	}
 
+	puts("[+] Succeeded");
 	return 0;
 }
 ```
